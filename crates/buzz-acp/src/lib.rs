@@ -1827,10 +1827,10 @@ async fn tokio_main() -> Result<()> {
             Some(include_str!("base_prompt.md"))
         },
         heartbeat_prompt: config.heartbeat_prompt.clone(),
-        cwd: std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("/"))
-            .to_string_lossy()
-            .to_string(),
+        // Baseline fork (ADR-063): an explicit `--agent-cwd` wins over the
+        // harness's own directory, so an employee is not handed whatever
+        // repository buzz-acp happened to be launched in.
+        cwd: resolve_agent_cwd(config.agent_cwd.as_deref()),
         rest_client: relay.rest_client(),
         channel_info: pool::ChannelInfoResolver::new(channel_info_map, relay.rest_client()),
         context_message_limit: config.context_message_limit,
@@ -1883,6 +1883,11 @@ async fn tokio_main() -> Result<()> {
         None
     };
     let mut typing_channels: HashMap<Uuid, ThreadTags> = HashMap::new();
+    // Channels where the agent published a message of its own during the current
+    // turn (Baseline fork, ADR-063). Consumed — and cleared — when that channel's
+    // turn completes, so it can only ever suppress the reply for the turn it was
+    // observed in.
+    let mut self_posted_channels: HashSet<Uuid> = HashSet::new();
     let mut presence_task: Option<tokio::task::JoinHandle<()>> = None;
 
     // Independent of pool readiness: a never-mentioned lazy agent must still
@@ -2327,6 +2332,15 @@ async fn tokio_main() -> Result<()> {
                             }
 
                             if config.ignore_self && buzz_event.event.pubkey.to_hex() == pubkey_hex {
+                                // Baseline fork (ADR-063): before dropping our own
+                                // event, note that the agent posted a message in this
+                                // channel. That is the exactly-once signal for the
+                                // automatic reply — an agent that called
+                                // `buzz messages send` itself must not also have its
+                                // transcript delivered on its behalf.
+                                if kind_u32 == KIND_STREAM_MESSAGE {
+                                    self_posted_channels.insert(buzz_event.channel_id);
+                                }
                                 tracing::debug!(channel_id = %buzz_event.channel_id, "dropping self-authored event");
                                 continue;
                             }
@@ -2673,10 +2687,39 @@ async fn tokio_main() -> Result<()> {
         };
 
         match pool_event {
-            Some(PoolEvent::Result(result)) => {
-                // Stop typing indicator for the completed channel.
-                if let PromptSource::Channel(ch) = &result.source {
-                    typing_channels.remove(ch);
+            Some(PoolEvent::Result(mut result)) => {
+                // Stop typing indicator for the completed channel. The removed
+                // value carries the thread context the reply must be anchored to.
+                let completed_thread_tags = match &result.source {
+                    PromptSource::Channel(ch) => typing_channels.remove(ch),
+                    PromptSource::Heartbeat => None,
+                };
+                // Baseline fork (ADR-063): Hermes owns the answer, Buzz owns
+                // delivering it. Deliver before `handle_prompt_result` consumes
+                // the result, because that is what still owns the agent whose
+                // transcript we need.
+                if config.auto_reply {
+                    if let PromptSource::Channel(channel_id) = result.source {
+                        // Two independent signals, because the relay-side one
+                        // alone produced a duplicate on the first real hosted run:
+                        // in Mentions mode the agent's own message never comes
+                        // back to this subscription, so only the in-turn tool call
+                        // is reliable. The relay signal is kept for the case where
+                        // the agent posts through some path this harness did not
+                        // observe as a tool call.
+                        let agent_posted = self_posted_channels.remove(&channel_id)
+                            || result.agent.acp.turn_used_buzz_send();
+                        let answer = result.agent.acp.take_turn_text();
+                        deliver_agent_reply(
+                            &relay,
+                            channel_id,
+                            &answer,
+                            &result.outcome,
+                            agent_posted,
+                            completed_thread_tags.as_ref(),
+                        )
+                        .await;
+                    }
                 }
                 if handle_prompt_result(
                     &mut pool,
@@ -3396,6 +3439,120 @@ fn spawn_failure_notice(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Why an automatic conversational reply was or was not delivered
+/// (Baseline fork, ADR-063).
+///
+/// Separated from the publish call so the policy is unit-testable without a
+/// relay, and so a suppressed reply always states its reason instead of being
+/// a silent no-op.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReplyDecision {
+    /// Deliver this text to the originating channel.
+    Deliver,
+    /// The agent already posted its own message during this turn.
+    SuppressedAgentPosted,
+    /// The turn produced no assistant text worth sending.
+    SuppressedEmpty,
+    /// The turn did not end normally, so any partial text is not an answer.
+    SuppressedNotEndTurn,
+}
+
+/// Decide whether the accumulated turn transcript should be posted to Buzz.
+///
+/// **Baseline fork addition (ADR-063).** The rules, in order:
+///
+/// 1. An agent that called `buzz messages send` itself has already answered —
+///    delivering the transcript too would double the reply.
+/// 2. Only a turn that ended normally carries an answer. A cancelled, errored or
+///    timed-out turn may have streamed partial text, and posting that as though
+///    it were the employee's response would be a fabricated answer.
+/// 3. Whitespace-only output is not a message.
+pub fn decide_reply(
+    answer: &str,
+    outcome: &pool::PromptOutcome,
+    agent_posted: bool,
+) -> ReplyDecision {
+    if agent_posted {
+        return ReplyDecision::SuppressedAgentPosted;
+    }
+    if !matches!(outcome, pool::PromptOutcome::Ok(acp::StopReason::EndTurn)) {
+        return ReplyDecision::SuppressedNotEndTurn;
+    }
+    if answer.trim().is_empty() {
+        return ReplyDecision::SuppressedEmpty;
+    }
+    ReplyDecision::Deliver
+}
+
+/// Deliver the employee's final conversational response to the originating channel.
+///
+/// **Baseline fork addition (ADR-063).** Stock buzz-acp requires the agent to call
+/// `buzz messages send` itself; Slice 4D watched a model write that command out as
+/// prose and leave a human's question unanswered. Hermes owns the answer, Buzz owns
+/// delivering it.
+///
+/// The message is built with `buzz_sdk::builders::build_message` and signed with the
+/// agent's own keys, so it reuses the one canonical message path and carries the
+/// employee's identity — never the human's. Delivery failure is logged and never
+/// panics: a dropped reply must not take the harness down.
+async fn deliver_agent_reply(
+    relay: &relay::HarnessRelay,
+    channel_id: Uuid,
+    answer: &str,
+    outcome: &pool::PromptOutcome,
+    agent_posted: bool,
+    thread_tags: Option<&ThreadTags>,
+) {
+    match decide_reply(answer, outcome, agent_posted) {
+        ReplyDecision::Deliver => {}
+        reason => {
+            tracing::debug!(target: "acp::reply", %channel_id, ?reason, "no automatic reply");
+            return;
+        }
+    }
+
+    match relay.build_channel_message(channel_id, answer.trim(), thread_tags) {
+        Ok(event) => match relay.publish_event(event).await {
+            Ok(()) => tracing::info!(
+                target: "acp::reply",
+                %channel_id,
+                bytes = answer.trim().len(),
+                "delivered agent reply"
+            ),
+            Err(e) => {
+                tracing::warn!(target: "acp::reply", %channel_id, "reply publish failed: {e}")
+            }
+        },
+        Err(e) => tracing::warn!(target: "acp::reply", %channel_id, "reply build failed: {e}"),
+    }
+}
+
+/// Resolve the working directory handed to the agent's ACP session.
+///
+/// **Baseline fork addition (ADR-063).** `configured` is an operator-supplied
+/// absolute path; anything else falls back to the harness's own directory, which
+/// is the stock behaviour. Slice 4D observed an employee inherit Buzz's checkout —
+/// and Buzz's `AGENTS.md` — purely because the harness was started there, so the
+/// directory is now a deliberate setting rather than an accident of launch.
+///
+/// A relative path is rejected rather than silently joined to the harness cwd:
+/// ACP requires an absolute `cwd`, and quietly resolving it would reintroduce the
+/// same accidental coupling this exists to remove.
+fn resolve_agent_cwd(configured: Option<&str>) -> String {
+    if let Some(path) = configured {
+        if std::path::Path::new(path).is_absolute() {
+            return path.to_string();
+        }
+        tracing::warn!(
+            "ignoring --agent-cwd {path:?}: it must be an absolute path; using the harness directory"
+        );
+    }
+    std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("/"))
+        .to_string_lossy()
+        .to_string()
+}
+
 fn handle_prompt_result(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
@@ -6216,6 +6373,8 @@ mod build_mcp_servers_tests {
             agent_command: "goose".into(),
             agent_args: vec!["acp".into()],
             mcp_command: "test-mcp-server".into(),
+            agent_cwd: None,
+            auto_reply: true,
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
@@ -6438,6 +6597,8 @@ mod error_outcome_emission_tests {
             agent_command: "true".into(),
             agent_args: vec![],
             mcp_command: "test-mcp-server".into(),
+            agent_cwd: None,
+            auto_reply: true,
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
@@ -8158,5 +8319,125 @@ mod observer_payload_trim_tests {
         assert!(leaf.starts_with('…'));
         assert!(leaf.ends_with('…'));
         assert!(leaf.contains("[elided"));
+    }
+}
+
+/// Baseline fork (ADR-063): the automatic conversational return path.
+///
+/// Slice 4D proved that stock buzz-acp delivers a human's `@mention` all the way
+/// to the right employee's Hermes profile and then stops: the answer is streamed
+/// over ACP and never posted, because the agent is expected to call
+/// `buzz messages send` itself. A model that narrates that command instead of
+/// executing it leaves a human's question silently unanswered.
+#[cfg(test)]
+mod baseline_reply_tests {
+    use super::*;
+    use crate::acp::StopReason;
+    use crate::pool::PromptOutcome;
+
+    #[test]
+    fn delivers_a_normal_answer() {
+        assert_eq!(
+            decide_reply(
+                "CLASSIFICATION: URGENT\nTRADE: Plumber",
+                &PromptOutcome::Ok(StopReason::EndTurn),
+                false,
+            ),
+            ReplyDecision::Deliver
+        );
+    }
+
+    #[test]
+    fn suppresses_when_the_agent_already_posted() {
+        // Exactly-once: an agent that called `buzz messages send` has answered.
+        // Delivering the transcript as well would double the reply, which is the
+        // one regression this whole path could plausibly introduce.
+        assert_eq!(
+            decide_reply(
+                "I have posted my findings.",
+                &PromptOutcome::Ok(StopReason::EndTurn),
+                true,
+            ),
+            ReplyDecision::SuppressedAgentPosted
+        );
+    }
+
+    #[test]
+    fn the_agent_posting_wins_over_every_other_condition() {
+        // Ordering matters: the dedup check must come first, so a turn that both
+        // posted and then errored cannot fall through to a second delivery.
+        assert_eq!(
+            decide_reply("partial", &PromptOutcome::Cancelled, true),
+            ReplyDecision::SuppressedAgentPosted
+        );
+    }
+
+    #[test]
+    fn never_posts_partial_text_from_an_abnormal_turn() {
+        // A cancelled/timed-out/errored turn may have streamed text. Posting it as
+        // though it were the employee's answer would be a fabricated response —
+        // the precise failure mode CLAUDE.md 14A forbids.
+        // Labelled rather than `{outcome:?}`: PromptOutcome is upstream and does
+        // not derive Debug, and widening it just for a test message would add
+        // merge surface for no benefit.
+        for (label, outcome) in [
+            ("cancelled", PromptOutcome::Cancelled),
+            ("agent exited", PromptOutcome::AgentExited),
+            ("max tokens", PromptOutcome::Ok(StopReason::MaxTokens)),
+        ] {
+            assert_eq!(
+                decide_reply("half an answ", &outcome, false),
+                ReplyDecision::SuppressedNotEndTurn,
+                "{label} must not be delivered as an answer"
+            );
+        }
+    }
+
+    #[test]
+    fn whitespace_only_output_is_not_a_message() {
+        assert_eq!(
+            decide_reply("   \n\t ", &PromptOutcome::Ok(StopReason::EndTurn), false),
+            ReplyDecision::SuppressedEmpty
+        );
+        assert_eq!(
+            decide_reply("", &PromptOutcome::Ok(StopReason::EndTurn), false),
+            ReplyDecision::SuppressedEmpty
+        );
+    }
+}
+
+/// Baseline fork (ADR-063): the employee working directory must be deliberate.
+#[cfg(test)]
+mod baseline_agent_cwd_tests {
+    use super::*;
+
+    #[test]
+    fn an_absolute_configured_path_is_used_verbatim() {
+        assert_eq!(
+            resolve_agent_cwd(Some("/opt/baseline/workspaces/marcus")),
+            "/opt/baseline/workspaces/marcus"
+        );
+    }
+
+    #[test]
+    fn no_configuration_falls_back_to_the_harness_directory() {
+        let expected = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/"))
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(resolve_agent_cwd(None), expected);
+    }
+
+    #[test]
+    fn a_relative_path_is_refused_rather_than_silently_joined() {
+        // Resolving "workspaces/marcus" against the harness cwd would put the
+        // employee back inside whatever repository launched buzz-acp — exactly the
+        // accidental coupling Slice 4D found, reintroduced by a convenience.
+        let harness = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/"))
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(resolve_agent_cwd(Some("workspaces/marcus")), harness);
+        assert_eq!(resolve_agent_cwd(Some("")), harness);
     }
 }

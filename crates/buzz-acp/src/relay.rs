@@ -855,6 +855,46 @@ impl HarnessRelay {
             .map_err(|_| RelayError::ConnectionClosed)
     }
 
+    /// Build a signed channel message (kind:9) carrying the agent's own identity.
+    ///
+    /// **Baseline fork addition (ADR-063).** Used to deliver an employee's final
+    /// conversational ACP response to the originating channel. It delegates to
+    /// `buzz_sdk::builders::build_message` rather than assembling tags here, so
+    /// there is exactly one message-construction path in the codebase, and signs
+    /// with the harness's agent keys — the human's key is never in scope.
+    ///
+    /// `thread_tags` anchors the reply to the message that triggered it via NIP-10
+    /// root/parent references. When it is absent the reply is posted to the channel
+    /// without thread context rather than guessing at a parent.
+    pub fn build_channel_message(
+        &self,
+        channel_id: Uuid,
+        content: &str,
+        thread_tags: Option<&crate::queue::ThreadTags>,
+    ) -> Result<Event, RelayError> {
+        let thread_ref = thread_tags.and_then(|t| {
+            let parent = t
+                .parent_event_id
+                .as_deref()
+                .or(t.root_event_id.as_deref())?;
+            let root = t.root_event_id.as_deref().unwrap_or(parent);
+            Some(buzz_sdk::ThreadRef {
+                root_event_id: nostr::EventId::from_hex(root).ok()?,
+                parent_event_id: nostr::EventId::from_hex(parent).ok()?,
+            })
+        });
+        let builder = buzz_sdk::builders::build_message(
+            channel_id,
+            content,
+            thread_ref.as_ref(),
+            &[],
+            false,
+            &[],
+        )
+        .map_err(|e| RelayError::AuthFailed(e.to_string()))?;
+        builder.sign_with_keys(&self.keys).map_err(Into::into)
+    }
+
     /// Build a typing indicator event (kind:20002) for a channel.
     pub fn build_typing_event(
         &self,

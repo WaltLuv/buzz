@@ -261,6 +261,25 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_MCP_COMMAND", default_value = "")]
     pub mcp_command: String,
 
+    /// Absolute working directory for the agent's ACP session (Baseline fork, ADR-063).
+    ///
+    /// Defaults to the harness's own current directory, which is how an employee
+    /// ends up inheriting whatever repository `buzz-acp` happened to be launched
+    /// in — Slice 4D observed Buzz's own `AGENTS.md` entering an employee's system
+    /// prompt for exactly that reason. Set this to give the employee a deliberate
+    /// workspace instead of an accidental one.
+    #[arg(long = "agent-cwd", env = "BUZZ_ACP_AGENT_CWD")]
+    pub agent_cwd: Option<String>,
+
+    /// Deliver the agent's final conversational response to the originating
+    /// channel automatically (Baseline fork, ADR-063). Enabled by default.
+    ///
+    /// Stock behaviour requires the agent to call `buzz messages send` itself.
+    /// When the agent does post its own reply during the turn, the automatic
+    /// delivery is suppressed, so enabling this never doubles a reply.
+    #[arg(long = "no-auto-reply", env = "BUZZ_ACP_NO_AUTO_REPLY")]
+    pub no_auto_reply: bool,
+
     /// Idle timeout: max seconds of silence before killing a turn.
     /// Resets on any agent stdout activity.
     #[arg(long, env = "BUZZ_ACP_IDLE_TIMEOUT")]
@@ -500,6 +519,12 @@ pub struct Config {
     pub agent_command: String,
     pub agent_args: Vec<String>,
     pub mcp_command: String,
+    /// Absolute working directory for the agent session; `None` = harness cwd.
+    /// Baseline fork, ADR-063.
+    pub agent_cwd: Option<String>,
+    /// Deliver the agent's final conversational response automatically.
+    /// Baseline fork, ADR-063.
+    pub auto_reply: bool,
     pub idle_timeout_secs: u64,
     pub max_turn_duration_secs: u64,
     pub agents: u32,
@@ -1066,6 +1091,8 @@ impl Config {
             agent_command,
             agent_args,
             mcp_command: args.mcp_command,
+            agent_cwd: args.agent_cwd,
+            auto_reply: !args.no_auto_reply,
             idle_timeout_secs,
             max_turn_duration_secs,
             agents: args.agents,
@@ -1445,6 +1472,8 @@ mod tests {
             agent_command: "goose".into(),
             agent_args: vec!["acp".into()],
             mcp_command: "".into(),
+            agent_cwd: None,
+            auto_reply: true,
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,

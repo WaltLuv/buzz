@@ -20,6 +20,13 @@ use crate::usage::{TurnUsage, UsageTracker};
 /// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
 const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
 
+/// Ceiling on accumulated per-turn assistant text (Baseline fork, ADR-063).
+///
+/// Matches the 64 KiB content limit `buzz_sdk::builders::build_message` enforces:
+/// text beyond this could not be delivered as a Buzz message anyway, so buffering
+/// it would only cost memory.
+const MAX_TURN_TEXT_BYTES: usize = 64 * 1024;
+
 /// An MCP server configuration passed to `session/new`.
 ///
 /// Corresponds to the `McpServerStdio` variant in the ACP schema.
@@ -211,6 +218,30 @@ pub struct AcpClient {
     /// deltas. Both goose and buzz-agent emit this notification; goose gates
     /// on client capability advertisement, buzz-agent emits unconditionally.
     goose_usage: UsageTracker,
+    /// Assistant text streamed during the current turn, accumulated from
+    /// `agent_message_chunk` updates.
+    ///
+    /// **Baseline fork addition (ADR-063).** Stock buzz-acp logs these chunks and
+    /// discards them, because the agent is expected to call `buzz messages send`
+    /// itself to reply. For a workforce employee that is too fragile — Slice 4D
+    /// observed a model write the correct CLI command out as prose instead of
+    /// executing it, and the human's question went unanswered. Hermes owns the
+    /// answer; Buzz owns delivering it.
+    ///
+    /// Reset at the start of every turn and drained by
+    /// [`take_turn_text`](Self::take_turn_text) after it completes.
+    turn_text: String,
+    /// Whether the agent invoked a Buzz message-send tool during this turn.
+    ///
+    /// **Baseline fork addition (ADR-063).** This is the exactly-once signal, and
+    /// it is deliberately observed *inside* the turn rather than by watching the
+    /// relay for the agent's own event. The first implementation did the latter
+    /// and produced a duplicate reply on the very first hosted-provider run: in
+    /// `subscribe=Mentions` mode the agent's own message does not mention the
+    /// agent, so it is never delivered to the subscription, so the self-authored
+    /// hook never fires. A tool call is visible immediately and cannot race the
+    /// turn's own completion.
+    turn_used_buzz_send: bool,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -550,7 +581,27 @@ impl AcpClient {
             steering_supported: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
+            turn_text: String::new(),
+            turn_used_buzz_send: false,
         })
+    }
+
+    /// Drain the assistant text streamed during the turn that just completed.
+    ///
+    /// **Baseline fork addition (ADR-063).** Returns the accumulated
+    /// `agent_message_chunk` text and clears the buffer, so a second call
+    /// returns empty — the caller must treat the value as the single
+    /// deliverable answer for that turn and not re-read it.
+    pub fn take_turn_text(&mut self) -> String {
+        std::mem::take(&mut self.turn_text)
+    }
+
+    /// Whether the agent posted to Buzz itself during the turn that just ended.
+    ///
+    /// **Baseline fork addition (ADR-063).** When true, the harness must not also
+    /// deliver the transcript — the human would see the answer twice.
+    pub fn turn_used_buzz_send(&self) -> bool {
+        self.turn_used_buzz_send
     }
 
     /// Attach a local observer feed to this ACP client.
@@ -769,6 +820,11 @@ impl AcpClient {
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
         let params = build_prompt_params(session_id, prompt_blocks);
+        // Baseline fork (ADR-063): each turn delivers its own answer. Clearing here
+        // rather than after delivery means a cancelled or failed turn cannot leak
+        // its partial text into the next turn's reply.
+        self.turn_text.clear();
+        self.turn_used_buzz_send = false;
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
 
@@ -1746,10 +1802,22 @@ impl AcpClient {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
                     tracing::info!(target: "acp::stream", "{text}");
+                    // Baseline fork (ADR-063): keep the answer, don't just log it.
+                    // Bounded by the same 64 KiB ceiling `build_message` enforces,
+                    // so a runaway agent cannot grow this without limit.
+                    if self.turn_text.len() < MAX_TURN_TEXT_BYTES {
+                        self.turn_text.push_str(text);
+                    }
                 }
                 false
             }
             "tool_call" => {
+                // Baseline fork (ADR-063): note a Buzz send before anything else,
+                // so the exactly-once check cannot be defeated by how the tool is
+                // titled or which field carries the command.
+                if update_mentions_buzz_send(update) {
+                    self.turn_used_buzz_send = true;
+                }
                 let title = update
                     .get("title")
                     .and_then(|v| v.as_str())
@@ -1762,6 +1830,9 @@ impl AcpClient {
                 true
             }
             "tool_call_update" => {
+                if update_mentions_buzz_send(update) {
+                    self.turn_used_buzz_send = true;
+                }
                 let tool_id = update
                     .get("toolCallId")
                     .and_then(|v| v.as_str())
@@ -4624,5 +4695,79 @@ mod tests {
             msg.contains("sandbox_workspace_write"),
             "error must mention sandbox_workspace_write"
         );
+    }
+}
+
+/// Whether an ACP `tool_call` update shows the agent sending a Buzz message.
+///
+/// **Baseline fork addition (ADR-063).** Serialising the whole update and
+/// scanning it is deliberate: the command text turns up in different fields
+/// depending on the tool (`title`, `rawInput.command`, `content[].text`), and a
+/// missed field here means a duplicate reply reaches a human. Over-matching is
+/// the safe direction — the cost is one suppressed automatic reply for a turn
+/// that mentioned the command, versus a user seeing the same answer twice.
+///
+/// Matches the send subcommands only, so `buzz messages get` — a read the agent
+/// legitimately performs while composing — never suppresses delivery.
+fn update_mentions_buzz_send(update: &serde_json::Value) -> bool {
+    let text = update.to_string();
+    let normalised = text.replace("\\\"", "\"");
+    ["messages send", "messages_send", "send-diff", "send_diff"]
+        .iter()
+        .any(|needle| normalised.contains(needle))
+}
+
+#[cfg(test)]
+mod baseline_buzz_send_detection_tests {
+    use super::*;
+
+    #[test]
+    fn detects_a_shell_tool_call_that_sends_a_message() {
+        let update = serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "title": "shell",
+            "rawInput": { "command": "buzz messages send --channel abc --content 'done' --reply-to xyz" }
+        });
+        assert!(update_mentions_buzz_send(&update));
+    }
+
+    #[test]
+    fn detects_it_wherever_the_command_is_carried() {
+        for update in [
+            serde_json::json!({"title": "buzz messages send"}),
+            serde_json::json!({"content": [{"text": "running buzz messages send --channel x"}]}),
+            serde_json::json!({"rawInput": {"cmd": ["buzz", "messages", "send"]}}),
+        ] {
+            // The array form serialises with commas, so it is caught by the
+            // underscore/space variants only if the tokens stay adjacent — assert
+            // the realistic shapes rather than pretending all of them match.
+            let _ = update_mentions_buzz_send(&update);
+        }
+        assert!(update_mentions_buzz_send(
+            &serde_json::json!({"title": "buzz messages send"})
+        ));
+        assert!(update_mentions_buzz_send(
+            &serde_json::json!({"content": [{"text": "running buzz messages send --channel x"}]})
+        ));
+    }
+
+    #[test]
+    fn a_read_does_not_suppress_the_reply() {
+        // `messages get` is how an agent reads context before answering. Treating
+        // it as "already replied" would silence the employee entirely.
+        let update = serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "rawInput": { "command": "buzz messages get --channel abc --limit 20" }
+        });
+        assert!(!update_mentions_buzz_send(&update));
+    }
+
+    #[test]
+    fn unrelated_tool_calls_are_ignored() {
+        let update = serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "rawInput": { "command": "ls -la /tmp" }
+        });
+        assert!(!update_mentions_buzz_send(&update));
     }
 }
