@@ -271,6 +271,23 @@ pub struct CliArgs {
     #[arg(long = "agent-cwd", env = "BUZZ_ACP_AGENT_CWD")]
     pub agent_cwd: Option<String>,
 
+    /// Baseline Workforce OS base URL for BusinessTask intake (ADR-070).
+    ///
+    /// When set, an explicit `!work` request creates a canonical BusinessTask in
+    /// Baseline before the employee is prompted, and the result is recorded
+    /// against it. When unset the harness behaves exactly as before — Baseline
+    /// integration is opt-in, so the fork stays usable without it.
+    #[arg(long = "baseline-url", env = "BUZZ_ACP_BASELINE_URL")]
+    pub baseline_url: Option<String>,
+
+    /// Admin token for the Baseline task API (ADR-029 gate). Never logged.
+    #[arg(
+        long = "baseline-token",
+        env = "BUZZ_ACP_BASELINE_TOKEN",
+        hide_env_values = true
+    )]
+    pub baseline_token: Option<String>,
+
     /// Deliver the agent's final conversational response to the originating
     /// channel automatically (Baseline fork, ADR-063). Enabled by default.
     ///
@@ -522,6 +539,10 @@ pub struct Config {
     /// Absolute working directory for the agent session; `None` = harness cwd.
     /// Baseline fork, ADR-063.
     pub agent_cwd: Option<String>,
+    /// Baseline base URL for BusinessTask intake; `None` disables it (ADR-070).
+    pub baseline_url: Option<String>,
+    /// Baseline admin token; never logged (ADR-070).
+    pub baseline_token: Option<String>,
     /// Deliver the agent's final conversational response automatically.
     /// Baseline fork, ADR-063.
     pub auto_reply: bool,
@@ -1092,6 +1113,8 @@ impl Config {
             agent_args,
             mcp_command: args.mcp_command,
             agent_cwd: args.agent_cwd,
+            baseline_url: args.baseline_url,
+            baseline_token: args.baseline_token,
             auto_reply: !args.no_auto_reply,
             idle_timeout_secs,
             max_turn_duration_secs,
@@ -1473,6 +1496,8 @@ mod tests {
             agent_args: vec!["acp".into()],
             mcp_command: "".into(),
             agent_cwd: None,
+            baseline_url: None,
+            baseline_token: None,
             auto_reply: true,
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: DEFAULT_MAX_TURN_DURATION_SECS,

@@ -1888,6 +1888,13 @@ async fn tokio_main() -> Result<()> {
     // turn completes, so it can only ever suppress the reply for the turn it was
     // observed in.
     let mut self_posted_channels: HashSet<Uuid> = HashSet::new();
+    // Baseline BusinessTask id for the work request currently being served in a
+    // channel (ADR-070). Set when an explicit `!work` request is accepted,
+    // consumed when that channel's turn produces its result.
+    let mut channel_tasks: HashMap<Uuid, String> = HashMap::new();
+    // The agent's own most recent posted event per channel, used as the
+    // delivered reference when the agent replies through its own Buzz tool.
+    let mut self_posted_events: HashMap<Uuid, String> = HashMap::new();
     let mut presence_task: Option<tokio::task::JoinHandle<()>> = None;
 
     // Independent of pool readiness: a never-mentioned lazy agent must still
@@ -2340,9 +2347,50 @@ async fn tokio_main() -> Result<()> {
                                 // transcript delivered on its behalf.
                                 if kind_u32 == KIND_STREAM_MESSAGE {
                                     self_posted_channels.insert(buzz_event.channel_id);
+                                    // Keep the id too: when the agent posts its
+                                    // own reply there is no auto-delivered id,
+                                    // and a BusinessTask still needs structural
+                                    // proof of where the answer landed (ADR-070).
+                                    self_posted_events
+                                        .insert(buzz_event.channel_id, buzz_event.event.id.to_hex());
                                 }
                                 tracing::debug!(channel_id = %buzz_event.channel_id, "dropping self-authored event");
                                 continue;
+                            }
+
+                            // Baseline fork (ADR-070): an EXPLICIT work request
+                            // becomes a canonical BusinessTask before the
+                            // employee is prompted. Ordinary conversation never
+                            // does — the prefix is the human's deliberate act.
+                            if let (Some(base_url), Some(token)) =
+                                (config.baseline_url.as_deref(), config.baseline_token.as_deref())
+                            {
+                                if let Some(objective) =
+                                    extract_work_request(&buzz_event.event, kind_u32, &pubkey_hex)
+                                {
+                                    let thread = crate::queue::parse_thread_tags(&buzz_event.event);
+                                    if let Some(task) = baseline::create_task(
+                                        base_url,
+                                        token,
+                                        &objective,
+                                        &buzz_event.channel_id.to_string(),
+                                        thread.root_event_id.as_deref(),
+                                        &buzz_event.event.id.to_hex(),
+                                        &buzz_event.event.pubkey.to_hex(),
+                                        &pubkey_hex,
+                                    )
+                                    .await
+                                    {
+                                        tracing::info!(
+                                            target: "acp::baseline",
+                                            task_id = %task.task_id,
+                                            created = task.created,
+                                            channel_id = %buzz_event.channel_id,
+                                            "work request mapped to BusinessTask"
+                                        );
+                                        channel_tasks.insert(buzz_event.channel_id, task.task_id);
+                                    }
+                                }
                             }
 
                             // Check: kind:9, content "!shutdown", from owner, mentions THIS agent.
@@ -2710,7 +2758,7 @@ async fn tokio_main() -> Result<()> {
                         let agent_posted = self_posted_channels.remove(&channel_id)
                             || result.agent.acp.turn_used_buzz_send();
                         let answer = result.agent.acp.take_turn_text();
-                        deliver_agent_reply(
+                        let delivered = deliver_agent_reply(
                             &relay,
                             channel_id,
                             &answer,
@@ -2719,6 +2767,61 @@ async fn tokio_main() -> Result<()> {
                             completed_thread_tags.as_ref(),
                         )
                         .await;
+
+                        // Baseline fork (ADR-070): close the BusinessTask this
+                        // turn was serving — but only when the turn actually
+                        // produced an answer.
+                        //
+                        // A cancelled or interrupted turn must NOT close it. A
+                        // real run found this: two conversational messages had a
+                        // turn in flight when the `!work` request arrived, that
+                        // new event interrupted the turn, and the task was closed
+                        // FAILED against a cancellation while the genuine answer
+                        // was still a minute away. The task now stays mapped
+                        // until a turn ends normally, so a work request remains
+                        // open exactly as long as the work is.
+                        // Completed normally AND said something. Note this is
+                        // deliberately NOT "we auto-delivered": when the agent
+                        // posts its own reply (the 4D exactly-once path) there is
+                        // no delivered id, yet the work is done and the answer is
+                        // in the channel. Keying closure on delivery left such a
+                        // task open forever — found on the first clean run.
+                        let turn_answered = matches!(
+                            result.outcome,
+                            pool::PromptOutcome::Ok(acp::StopReason::EndTurn)
+                        ) && !answer.trim().is_empty();
+                        if turn_answered {
+                            if let Some(task_id) = channel_tasks.remove(&channel_id) {
+                                if let (Some(base_url), Some(token)) = (
+                                    config.baseline_url.as_deref(),
+                                    config.baseline_token.as_deref(),
+                                ) {
+                                    let summary =
+                                        answer.trim().chars().take(3500).collect::<String>();
+                                    baseline::record_result(
+                                        base_url,
+                                        token,
+                                        &task_id,
+                                        &summary,
+                                        // Prefer our own delivery id; fall back to
+                                        // the agent's own posted reply.
+                                        delivered.as_deref().or_else(|| {
+                                            self_posted_events.get(&channel_id).map(|s| s.as_str())
+                                        }),
+                                        false,
+                                    )
+                                    .await;
+                                }
+                            }
+                        } else if channel_tasks.contains_key(&channel_id) {
+                            // A cancelled or interrupted turn leaves the task
+                            // open: the work request is still outstanding.
+                            tracing::debug!(
+                                target: "acp::baseline",
+                                %channel_id,
+                                "turn produced no answer; BusinessTask stays open"
+                            );
+                        }
                     }
                 }
                 if handle_prompt_result(
@@ -3131,6 +3234,42 @@ fn is_owner_control_command(
         && event_mentions_agent(event, agent_pubkey_hex)
 }
 
+/// The prefix that turns a Buzz message into a Baseline work request
+/// (Baseline fork, ADR-070).
+pub const WORK_REQUEST_PREFIX: &str = "!work";
+
+/// Extract the objective from an explicit work request, if this event is one.
+///
+/// **Baseline fork addition (ADR-070).** A Buzz message is not a task. Ordinary
+/// conversation — "thanks Marcus", "why did you classify that urgent?" — must
+/// never become company work, so conversion is a deliberate human act with its
+/// own prefix rather than a model deciding a sentence looked like a request.
+/// This deliberately mirrors the existing `!shutdown` / `!cancel` owner-control
+/// shape: a kind:9 message, from the owner, mentioning this agent.
+///
+/// Returns `None` for anything that is not a work request, and for a work
+/// request with no objective — an empty task is not work.
+pub fn extract_work_request(
+    event: &nostr::Event,
+    kind_u32: u32,
+    agent_pubkey_hex: &str,
+) -> Option<String> {
+    if kind_u32 != KIND_STREAM_MESSAGE || !event_mentions_agent(event, agent_pubkey_hex) {
+        return None;
+    }
+    let content = event.content.trim();
+    let rest = content.strip_prefix(WORK_REQUEST_PREFIX)?;
+    // Require a separator so `!workaround` is not a work request.
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let objective = rest.trim();
+    if objective.is_empty() {
+        return None;
+    }
+    Some(objective.to_string())
+}
+
 // ── signal_in_flight_task ─────────────────────────────────────────────────────
 
 /// Decide which [`ControlSignal`] (if any) to send to an in-flight turn when a
@@ -3502,31 +3641,42 @@ async fn deliver_agent_reply(
     outcome: &pool::PromptOutcome,
     agent_posted: bool,
     thread_tags: Option<&ThreadTags>,
-) {
+) -> Option<String> {
     match decide_reply(answer, outcome, agent_posted) {
         ReplyDecision::Deliver => {}
         reason => {
             tracing::debug!(target: "acp::reply", %channel_id, ?reason, "no automatic reply");
-            return;
+            return None;
         }
     }
 
     match relay.build_channel_message(channel_id, answer.trim(), thread_tags) {
-        Ok(event) => match relay.publish_event(event).await {
-            Ok(()) => tracing::info!(
-                target: "acp::reply",
-                %channel_id,
-                bytes = answer.trim().len(),
-                "delivered agent reply"
-            ),
-            Err(e) => {
-                tracing::warn!(target: "acp::reply", %channel_id, "reply publish failed: {e}")
+        Ok(event) => {
+            // Captured before publishing so the id can be recorded against a
+            // BusinessTask as proof of where the answer was returned (ADR-070).
+            let event_id = event.id.to_hex();
+            match relay.publish_event(event).await {
+                Ok(()) => {
+                    tracing::info!(
+                        target: "acp::reply",
+                        %channel_id,
+                        bytes = answer.trim().len(),
+                        "delivered agent reply"
+                    );
+                    Some(event_id)
+                }
+                Err(e) => {
+                    tracing::warn!(target: "acp::reply", %channel_id, "reply publish failed: {e}");
+                    None
+                }
             }
-        },
-        Err(e) => tracing::warn!(target: "acp::reply", %channel_id, "reply build failed: {e}"),
+        }
+        Err(e) => {
+            tracing::warn!(target: "acp::reply", %channel_id, "reply build failed: {e}");
+            None
+        }
     }
 }
-
 /// Resolve the working directory handed to the agent's ACP session.
 ///
 /// **Baseline fork addition (ADR-063).** `configured` is an operator-supplied
@@ -6374,6 +6524,8 @@ mod build_mcp_servers_tests {
             agent_args: vec!["acp".into()],
             mcp_command: "test-mcp-server".into(),
             agent_cwd: None,
+            baseline_url: None,
+            baseline_token: None,
             auto_reply: true,
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
@@ -6598,6 +6750,8 @@ mod error_outcome_emission_tests {
             agent_args: vec![],
             mcp_command: "test-mcp-server".into(),
             agent_cwd: None,
+            baseline_url: None,
+            baseline_token: None,
             auto_reply: true,
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
@@ -8439,5 +8593,190 @@ mod baseline_agent_cwd_tests {
             .to_string();
         assert_eq!(resolve_agent_cwd(Some("workspaces/marcus")), harness);
         assert_eq!(resolve_agent_cwd(Some("")), harness);
+    }
+}
+
+/// Baseline fork (ADR-070): explicit work-request detection.
+///
+/// A Buzz message is not a BusinessTask. These tests pin the boundary, because
+/// the failure mode is not a crash — it is a workplace that quietly files
+/// company work every time somebody says thank you.
+#[cfg(test)]
+mod baseline_work_request_tests {
+    use super::*;
+    use buzz_core::kind::KIND_STREAM_MESSAGE;
+    use nostr::{EventBuilder, Keys, Kind, Tag};
+
+    fn event_for(agent: &str, content: &str) -> nostr::Event {
+        let keys = Keys::generate();
+        EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), content)
+            .tags(vec![Tag::parse(["p", agent]).expect("p tag")])
+            .sign_with_keys(&keys)
+            .expect("sign")
+    }
+
+    fn agent_hex() -> String {
+        Keys::generate().public_key().to_hex()
+    }
+
+    #[test]
+    fn an_explicit_request_yields_its_objective() {
+        let agent = agent_hex();
+        let e = event_for(&agent, "!work Summarise this week's open maintenance items");
+        assert_eq!(
+            extract_work_request(&e, KIND_STREAM_MESSAGE, &agent).as_deref(),
+            Some("Summarise this week's open maintenance items")
+        );
+    }
+
+    #[test]
+    fn ordinary_conversation_is_never_work() {
+        // The whole point of the boundary. None of these may file company work.
+        let agent = agent_hex();
+        for content in [
+            "Hey Marcus, thanks",
+            "why did you classify that urgent?",
+            "@Marcus what do you think?",
+            "can you take a look when you get a chance",
+            "work on this please",
+            "",
+        ] {
+            let e = event_for(&agent, content);
+            assert!(
+                extract_work_request(&e, KIND_STREAM_MESSAGE, &agent).is_none(),
+                "{content:?} must not become a task"
+            );
+        }
+    }
+
+    #[test]
+    fn the_prefix_needs_a_separator() {
+        // `!workaround` is a word, not a command.
+        let agent = agent_hex();
+        let e = event_for(&agent, "!workaround for the boiler");
+        assert!(extract_work_request(&e, KIND_STREAM_MESSAGE, &agent).is_none());
+    }
+
+    #[test]
+    fn a_request_with_no_objective_is_refused() {
+        let agent = agent_hex();
+        for content in ["!work", "!work    "] {
+            let e = event_for(&agent, content);
+            assert!(
+                extract_work_request(&e, KIND_STREAM_MESSAGE, &agent).is_none(),
+                "an empty task is not work: {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_must_mention_this_agent() {
+        // Otherwise a request aimed at Vivian would file work against Marcus.
+        let agent = agent_hex();
+        let other = agent_hex();
+        let e = event_for(&other, "!work do the thing");
+        assert!(extract_work_request(&e, KIND_STREAM_MESSAGE, &agent).is_none());
+    }
+}
+
+/// Minimal Baseline Workforce OS client for BusinessTask intake (ADR-070).
+///
+/// **Baseline fork addition.** Deliberately tiny and one-directional: the
+/// harness tells Baseline that a human asked for work, and later what the answer
+/// was. It reads no workforce state and holds no authority — Baseline owns the
+/// task, and Buzz owns the conversation it came from.
+///
+/// Every failure is non-fatal. A workplace that stops answering people because a
+/// task could not be filed would be a worse workplace; the miss is logged and
+/// the conversation continues.
+pub mod baseline {
+    use serde_json::json;
+
+    /// A task Baseline created (or matched) for a work request.
+    #[derive(Debug, Clone)]
+    pub struct TaskRef {
+        pub task_id: String,
+        /// False when this origin event had already created the task.
+        pub created: bool,
+    }
+
+    fn client() -> reqwest::Client {
+        reqwest::Client::new()
+    }
+
+    /// Create the canonical BusinessTask for an explicit work request.
+    ///
+    /// Idempotent on `message_ref` server-side, so a reconnect or duplicate
+    /// delivery returns the same task rather than filing the work twice.
+    pub async fn create_task(
+        base_url: &str,
+        token: &str,
+        objective: &str,
+        channel_ref: &str,
+        thread_ref: Option<&str>,
+        message_ref: &str,
+        requested_by: &str,
+        agent_pubkey: &str,
+    ) -> Option<TaskRef> {
+        let body = json!({
+            "objective": objective,
+            "channelRef": channel_ref,
+            "threadRef": thread_ref,
+            "messageRef": message_ref,
+            "requestedByRef": requested_by,
+            "agentPubkey": agent_pubkey,
+        });
+        let resp = client()
+            .post(format!("{}/api/tasks", base_url.trim_end_matches('/')))
+            .header("x-baseline-admin-token", token)
+            .json(&body)
+            .send()
+            .await
+            .ok()?;
+        let status = resp.status();
+        let value: serde_json::Value = resp.json().await.ok()?;
+        if !status.is_success() {
+            tracing::warn!(target: "acp::baseline", "task intake refused: {}", value);
+            return None;
+        }
+        Some(TaskRef {
+            task_id: value["task"]["taskId"].as_str()?.to_string(),
+            created: value["created"].as_bool().unwrap_or(false),
+        })
+    }
+
+    /// Record the real result against the task and close it.
+    pub async fn record_result(
+        base_url: &str,
+        token: &str,
+        task_id: &str,
+        result_summary: &str,
+        delivered_ref: Option<&str>,
+        failed: bool,
+    ) {
+        let body = json!({
+            "resultSummary": result_summary,
+            "deliveredRef": delivered_ref,
+            "failed": failed,
+        });
+        let sent = client()
+            .post(format!(
+                "{}/api/tasks/{}/result",
+                base_url.trim_end_matches('/'),
+                task_id
+            ))
+            .header("x-baseline-admin-token", token)
+            .json(&body)
+            .send()
+            .await;
+        match sent {
+            Ok(r) if r.status().is_success() => {
+                tracing::info!(target: "acp::baseline", task_id, "result recorded against BusinessTask")
+            }
+            Ok(r) => {
+                tracing::warn!(target: "acp::baseline", task_id, "result rejected: {}", r.status())
+            }
+            Err(e) => tracing::warn!(target: "acp::baseline", task_id, "result not recorded: {e}"),
+        }
     }
 }
